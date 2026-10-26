@@ -126,6 +126,10 @@ class Blocked(Exception):
     pass
 
 
+class NoData(Exception):
+    pass
+
+
 def fetch():
     """Тот же запрос, что делает окно iPhone Availability на сайте Apple (по одному на артикул)."""
     stores = {}
@@ -140,6 +144,8 @@ def fetch():
             merged = stores.setdefault(st["storeNumber"], dict(st, partsAvailability={}))
             merged["partsAvailability"].update(st.get("partsAvailability") or {})
         time.sleep(0.3)
+    if not stores:
+        raise NoData("Apple вернул ответ без магазинов")
     return {"stores": list(stores.values())}
 
 
@@ -231,6 +237,7 @@ def main():
     first = True
     errors = 0
     warned = False
+    down_since = last_warn = 0.0
 
     poll_commands()  # сбросить старые команды
     tg_send("🔌 Бот запущен, проверяю Apple...\nКоманды: /check — проверить сейчас, /status — статус")
@@ -250,7 +257,8 @@ def main():
                 print(msg)
 
             if warned:
-                tg_send("🟢 Связь с Apple восстановлена, мониторинг продолжается.")
+                tg_send(f"🟢 Связь с Apple восстановлена (был сбой ~{int((time.time() - down_since) / 60)} мин), "
+                        "мониторинг продолжается.")
                 warned = False
             errors = 0
 
@@ -271,23 +279,25 @@ def main():
             print(f"{stamp} ok, available: {len(now)}")
             wait_and_listen(INTERVAL + random.uniform(0, JITTER))
 
-        except Blocked as e:
+        except (Blocked, NoData, requests.RequestException, ValueError, KeyError) as e:
             errors += 1
-            note(False, f"Apple отклонил запрос ({e})")
-            wait = min(300, 30 * 2 ** (errors - 1))
-            print(f"{time.strftime('%H:%M:%S')} {e} -> пауза {wait}с")
-            if errors >= 1 and not warned:
-                tg_send(f"⚠️ Apple не отдаёт данные о наличии (ответ: {e}). Бот работает, повторяю проверку.")
-                warned = True
+            blocked = isinstance(e, Blocked)
+            what = f"Apple отклонил запрос ({e})" if blocked else f"{type(e).__name__}: {e}"
+            note(False, what)
+            wait = min(300, 30 * 2 ** (errors - 1)) if blocked else min(60, 5 * errors)
+            print(f"{time.strftime('%H:%M:%S')} {what} -> пауза {wait}с")
+            now_t = time.time()
+            if errors == 1:
+                down_since = now_t
+            if blocked or errors >= 3:
+                if not warned:
+                    tg_send(f"⚠️ Проблема с проверкой Apple: {what}.\nБот работает и повторяет попытки, "
+                            "о восстановлении сообщу.")
+                    warned, last_warn = True, now_t
+                elif now_t - last_warn >= 1800:
+                    tg_send(f"⚠️ Проблема сохраняется уже {int((now_t - down_since) / 60)} мин: {what}.")
+                    last_warn = now_t
             wait_and_listen(wait)
-        except (requests.RequestException, ValueError, KeyError) as e:
-            errors += 1
-            note(False, f"ошибка {e}")
-            print(f"{time.strftime('%H:%M:%S')} error: {e}")
-            if errors == 5 and not warned:
-                tg_send(f"⚠️ Ошибки при проверке: {e}")
-                warned = True
-            wait_and_listen(min(60, 5 * errors))
 
 
 if __name__ == "__main__":
