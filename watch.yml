@@ -1,0 +1,23 @@
+name: duo-watch
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # перезапуск, если предыдущий прогон закончился
+  workflow_dispatch:
+concurrency:
+  group: duo-watch
+  cancel-in-progress: false
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - run: python duo_watch.py
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          MAX_RUNTIME: "19800"
