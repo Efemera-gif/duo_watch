@@ -45,7 +45,7 @@ REPEAT_ALERTS = 3      # сколько раз подряд «долбить» �
 
 COUNTRY = "ae"
 BUY_URL = f"https://www.apple.com/{COUNTRY}/shop/buy-iphone/iphone-duo"
-API_URL = f"https://www.apple.com/{COUNTRY}/shop/fulfillment-messages"
+API_URL = f"https://www.apple.com/{COUNTRY}/shop/pickup-message-recommendations"
 TG_URL = ""
 
 HEADERS = {
@@ -127,15 +127,20 @@ class Blocked(Exception):
 
 
 def fetch():
-    params = [("pl", "true"), ("mts.0", "regular"), ("searchNearby", "true"),
-              ("location", LOCATION)]
-    for i, part in enumerate(PARTS):
-        params.append((f"parts.{i}", part))
-    r = session.get(API_URL, params=params, timeout=8)
-    if r.status_code in (403, 429, 503, 541):
-        raise Blocked(f"HTTP {r.status_code}")
-    r.raise_for_status()
-    return r.json()["body"]["content"]["pickupMessage"]
+    """Тот же запрос, что делает окно iPhone Availability на сайте Apple (по одному на артикул)."""
+    stores = {}
+    for part in PARTS:
+        url = (f"{API_URL}?fae=true&mts.0=regular&mts.1=compact"
+               f"&location={LOCATION}&product={part}")
+        r = session.get(url, timeout=8)
+        if r.status_code in (403, 429, 503, 541):
+            raise Blocked(f"HTTP {r.status_code}")
+        r.raise_for_status()
+        for st in r.json()["body"]["PickupMessage"]["stores"]:
+            merged = stores.setdefault(st["storeNumber"], dict(st, partsAvailability={}))
+            merged["partsAvailability"].update(st.get("partsAvailability") or {})
+        time.sleep(0.3)
+    return {"stores": list(stores.values())}
 
 
 def parse(pm):
@@ -145,10 +150,72 @@ def parse(pm):
         stores.append(s.get("storeName", s.get("storeNumber", "?")))
         for part, info in (s.get("partsAvailability") or {}).items():
             known.add(part)
-            if info.get("pickupDisplay") == "available":
+            if info.get("pickupDisplay") not in (None, "unavailable", "ineligible"):
                 quote = info.get("storePickupQuote") or info.get("pickupSearchQuote") or ""
                 available[(s.get("storeNumber"), part)] = (s.get("storeName", "?"), quote)
     return available, stores, known
+
+
+# ---------------- команды в Telegram ----------------
+STATE = {"checks": 0, "ok": 0, "last_time": "—", "last_result": "ещё не проверял", "available": 0}
+_offset = 0
+
+
+def note(ok: bool, result: str, available: int = 0) -> None:
+    STATE["checks"] += 1
+    STATE["ok"] += 1 if ok else 0
+    STATE["last_time"] = time.strftime("%H:%M:%S")
+    STATE["last_result"] = result
+    STATE["available"] = available
+
+
+def status_text() -> str:
+    return (f"📊 Проверок: {STATE['checks']}, успешных: {STATE['ok']}\n"
+            f"🕒 Последняя в {STATE['last_time']}: {STATE['last_result']}\n"
+            f"📦 В наличии сейчас: {STATE['available']}")
+
+
+def live_check() -> str:
+    """Принудительная проверка по команде /check."""
+    try:
+        pm = fetch()
+        now, stores, known = parse(pm)
+        note(True, f"Apple ответил, магазинов: {len(stores)}", len(now))
+        return (f"✅ Apple ответил.\nМагазинов: {len(stores)}\nВ наличии: {len(now)}\n"
+                f"Следим за: {', '.join(PARTS.values())}")
+    except Blocked as e:
+        note(False, f"Apple отклонил запрос ({e})")
+        return f"❌ Apple отвечает, но данных о наличии не отдаёт: {e}"
+    except (requests.RequestException, ValueError, KeyError) as e:
+        note(False, f"ошибка {e}")
+        return f"❌ Не удалось проверить: {e}"
+
+
+def poll_commands(timeout: int = 0) -> None:
+    global _offset
+    try:
+        r = requests.get(f"{TG_URL}/getUpdates",
+                         params={"offset": _offset, "timeout": timeout}, timeout=timeout + 10).json()
+    except requests.RequestException:
+        return
+    for upd in r.get("result", []):
+        _offset = upd["update_id"] + 1
+        msg = upd.get("message") or {}
+        if str((msg.get("chat") or {}).get("id")) != str(CHAT_ID):
+            continue
+        cmd = (msg.get("text") or "").strip().split("@")[0].lower()
+        if cmd in ("/check", "/проверка"):
+            tg_send("⏳ Проверяю Apple...")
+            tg_send(live_check())
+        elif cmd in ("/status", "/start"):
+            tg_send(status_text() + "\n\nКоманды: /check — проверить сейчас, /status — статус")
+
+
+def wait_and_listen(seconds: float) -> None:
+    """Вместо sleep: ждём и при этом отвечаем на команды."""
+    end = time.time() + seconds
+    while time.time() < end:
+        poll_commands(timeout=int(min(3, max(0, end - time.time()))))
 
 
 # ---------------- main loop ----------------
@@ -165,6 +232,8 @@ def main():
     errors = 0
     warned = False
 
+    poll_commands()  # сбросить старые команды
+    tg_send("🔌 Бот запущен, проверяю Apple...\nКоманды: /check — проверить сейчас, /status — статус")
     deadline = time.time() + MAX_RUNTIME if MAX_RUNTIME else None
     while deadline is None or time.time() < deadline:
         try:
@@ -173,13 +242,10 @@ def main():
 
             if first:
                 first = False
-                missing = [p for p in PARTS if p not in known]
                 msg = ("✅ Мониторинг запущен.\nМагазины: " + (", ".join(stores) or "—") +
                        f"\nИнтервал: ~{INTERVAL:.0f}с")
                 if not stores:
                     msg += "\n⚠️ Apple не вернул магазины — проверьте LOCATION."
-                if missing:
-                    msg += "\n⚠️ Apple не знает артикулы: " + ", ".join(missing)
                 tg_send(msg)
                 print(msg)
 
@@ -199,26 +265,29 @@ def main():
                 if key not in now:
                     tg_send(f"⚪️ Закончилось: {PARTS.get(key[1], key[1])} — {store}")
             prev = now
+            note(True, f"Apple ответил, магазинов: {len(stores)}", len(now))
 
             stamp = time.strftime("%H:%M:%S")
             print(f"{stamp} ok, available: {len(now)}")
-            time.sleep(INTERVAL + random.uniform(0, JITTER))
+            wait_and_listen(INTERVAL + random.uniform(0, JITTER))
 
         except Blocked as e:
             errors += 1
+            note(False, f"Apple отклонил запрос ({e})")
             wait = min(300, 30 * 2 ** (errors - 1))
             print(f"{time.strftime('%H:%M:%S')} {e} -> пауза {wait}с")
-            if errors >= 2 and not warned:
-                tg_send(f"⚠️ Apple временно ограничил запросы ({e}). Жду и продолжаю.")
+            if errors >= 1 and not warned:
+                tg_send(f"⚠️ Apple не отдаёт данные о наличии (ответ: {e}). Бот работает, повторяю проверку.")
                 warned = True
-            time.sleep(wait)
+            wait_and_listen(wait)
         except (requests.RequestException, ValueError, KeyError) as e:
             errors += 1
+            note(False, f"ошибка {e}")
             print(f"{time.strftime('%H:%M:%S')} error: {e}")
             if errors == 5 and not warned:
                 tg_send(f"⚠️ Ошибки при проверке: {e}")
                 warned = True
-            time.sleep(min(60, 5 * errors))
+            wait_and_listen(min(60, 5 * errors))
 
 
 if __name__ == "__main__":
